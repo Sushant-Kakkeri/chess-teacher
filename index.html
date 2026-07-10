@@ -1881,8 +1881,10 @@ if (typeof define !== 'undefined')
   .log-row .note{color:var(--text-dim);}
   .log-row.player .mv{color:var(--accent-soft);}
 
-  .controls-row{display:flex;gap:10px;}
-  .controls-row .btn{width:auto;flex:1;padding:11px 12px;font-size:13px;}
+  .controls-row{display:flex;gap:10px;flex-wrap:wrap;}
+  .controls-row .btn{width:auto;flex:1;padding:11px 12px;font-size:13px;min-width:120px;}
+  .suggestion-box{width:100%;max-width:520px;background:var(--panel-2);border:1px solid var(--accent);border-radius:10px;padding:10px 14px;font-size:13.5px;color:var(--text);}
+  .sq.suggested::after{content:"";position:absolute;inset:0;background:rgba(90,150,220,0.38);z-index:1;}
 
   /* Ask the coach */
   #coachThread{max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;margin-bottom:10px;}
@@ -2004,7 +2006,9 @@ if (typeof define !== 'undefined')
             </div>
           </div>
         </div>
+        <div class="suggestion-box" id="suggestionBox" style="display:none;"></div>
         <div class="controls-row" style="width:100%;max-width:520px;">
+          <button class="btn secondary" id="suggestBtn">💡 Suggest a move</button>
           <button class="btn secondary" id="undoBtn">Undo my last move</button>
           <button class="btn secondary" id="homeBtn">New / Home</button>
         </div>
@@ -2048,6 +2052,7 @@ var level = 2; // 0 beginner .. 3 more experienced
 var selectedSquare = null;
 var legalTargets = [];
 var lastMoveSquares = [];
+var suggestedSquares = [];
 var playerColor = 'w';
 var gameOver = false;
 var moveNumber = 1;
@@ -2106,10 +2111,35 @@ document.getElementById('undoBtn').addEventListener('click', function(){
   clearLog();
   rebuildLogFromHistory();
   selectedSquare = null; legalTargets = [];
+  hideSuggestion();
   drawBoard();
   updateStatusBar();
   document.getElementById('feedbackBody').innerHTML = '<p style="color:var(--text-dim)">Move undone. Try again.</p>';
   saveGame();
+});
+
+var HINT_DEPTH = 3; // always a decent suggestion, independent of the computer's own difficulty level
+var suggestionHideTimer = null;
+function hideSuggestion(){
+  suggestedSquares = [];
+  if(suggestionHideTimer){ clearTimeout(suggestionHideTimer); suggestionHideTimer = null; }
+  var box = document.getElementById('suggestionBox');
+  if(box){ box.style.display = 'none'; box.innerHTML = ''; }
+  drawBoard();
+}
+document.getElementById('suggestBtn').addEventListener('click', function(){
+  if(gameOver || game.turn()!==playerColor) return;
+  var ranked = rankedMoves(HINT_DEPTH);
+  if(ranked.length===0) return;
+  var top = ranked[0].move;
+  var desc = plainMove(top);
+  suggestedSquares = [top.from, top.to];
+  drawBoard();
+  var box = document.getElementById('suggestionBox');
+  box.style.display = 'block';
+  box.innerHTML = '💡 <strong>Suggested move:</strong> ' + desc + ' <span style="opacity:.7">(highlighted on the board)</span>';
+  if(suggestionHideTimer) clearTimeout(suggestionHideTimer);
+  suggestionHideTimer = setTimeout(hideSuggestion, 6000);
 });
 
 /* ---------------- Safe storage wrapper ----------------
@@ -2194,6 +2224,7 @@ function loadSavedGame(){
       level = data.level;
       gameOver = false;
       selectedSquare = null; legalTargets = []; lastMoveSquares = [];
+      hideSuggestion();
       document.getElementById('levelLabel').textContent = LEVELS[level].name;
       clearLog();
       drawBoard();
@@ -2209,6 +2240,7 @@ function startNewGame(lvl){
   level = lvl;
   gameOver = false;
   selectedSquare = null; legalTargets = []; lastMoveSquares = [];
+  hideSuggestion();
   document.getElementById('levelLabel').textContent = LEVELS[level].name;
   clearLog();
   drawBoard();
@@ -2254,6 +2286,7 @@ function drawBoard(){
       div.setAttribute('data-square', sq);
       if(selectedSquare===sq) div.className += ' selected';
       if(lastMoveSquares.indexOf(sq)!==-1) div.className += ' lastmove';
+      if(suggestedSquares.indexOf(sq)!==-1) div.className += ' suggested';
       if(kingInCheckSquare===sq) div.className += ' check';
       var piece = pos[r][c];
       if(piece){
@@ -2463,12 +2496,14 @@ if(ownerLockBtnEl) ownerLockBtnEl.addEventListener('click', function(){
   updateOwnerUI();
 });
 
-// Returns {ok, reason, text}. reason is one of: 'locked','not-configured','bad-key','error', or null on success.
+// Returns {ok, reason, text, detail}. reason is one of: 'locked','not-configured','bad-key','error', or null on success.
+// detail carries a short technical string (HTTP status / server error code / exception message)
+// so a failure can actually be diagnosed instead of just saying "something went wrong."
 async function askCoach(userPrompt){
   var key = getOwnerKey();
-  if(!key) return {ok:false, reason:'locked', text:null};
+  if(!key) return {ok:false, reason:'locked', text:null, detail:null};
   if(!COACH_WORKER_URL || COACH_WORKER_URL.indexOf('PASTE_YOUR_WORKER_URL_HERE')!==-1){
-    return {ok:false, reason:'not-configured', text:null};
+    return {ok:false, reason:'not-configured', text:null, detail:'COACH_WORKER_URL is still the placeholder value'};
   }
   try{
     var response = await fetch(COACH_WORKER_URL, {
@@ -2476,17 +2511,26 @@ async function askCoach(userPrompt){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ passphrase: key, prompt: userPrompt })
     });
+    var bodyJson = null;
+    try{ bodyJson = await response.json(); }catch(e){ /* body wasn't JSON, ignore */ }
+
     if(response.status===401){
-      clearOwnerKey();
-      updateOwnerUI();
-      return {ok:false, reason:'bad-key', text:null};
+      // NOTE: we deliberately do NOT clear the stored passphrase here anymore.
+      // Auto-clearing on every 401 made a misconfigured backend look like a
+      // "keeps forgetting my password" bug. Now it just reports the problem,
+      // and "Lock this device" is the only thing that clears it.
+      return {ok:false, reason:'bad-key', text:null, detail:'HTTP 401 — the Worker rejected the passphrase sent. Double-check the OWNER_PASSPHRASE secret matches exactly (no extra spaces).'};
     }
-    if(!response.ok) return {ok:false, reason:'error', text:null};
-    var data = await response.json();
-    var text = data && data.text ? String(data.text).trim() : null;
-    return {ok:true, reason:null, text:text};
+    if(!response.ok){
+      var code = bodyJson && bodyJson.error ? bodyJson.error : ('HTTP ' + response.status);
+      if(bodyJson && bodyJson.detail) code += ': ' + bodyJson.detail;
+      return {ok:false, reason:'error', text:null, detail:code};
+    }
+    var text = bodyJson && bodyJson.text ? String(bodyJson.text).trim() : null;
+    if(!text) return {ok:false, reason:'error', text:null, detail:'Worker responded OK but sent no text — check the Worker\'s logs for the OpenAI response.'};
+    return {ok:true, reason:null, text:text, detail:null};
   }catch(e){
-    return {ok:false, reason:'error', text:null};
+    return {ok:false, reason:'error', text:null, detail:'Network/fetch error: ' + (e && e.message ? e.message : String(e))};
   }
 }
 
@@ -2516,7 +2560,8 @@ function requestMoveCommentary(qualityLabel, plainDesc, reasonPhrase, betterPlai
     if(result.ok && result.text){
       loadingEl.outerHTML = '<p>' + result.text.replace(/</g,'&lt;') + '</p>';
     }else{
-      loadingEl.outerHTML = '<p style="font-style:normal;color:var(--text-dim);">(Coach commentary unavailable right now — the move rating above is still accurate.)</p>';
+      var detailBit = result.detail ? (' <span style="opacity:.7">[' + String(result.detail).replace(/</g,'&lt;') + ']</span>') : '';
+      loadingEl.outerHTML = '<p style="font-style:normal;color:var(--text-dim);">(Coach commentary unavailable right now — the move rating above is still accurate.)' + detailBit + '</p>';
     }
   });
 }
@@ -2546,6 +2591,7 @@ function makePlayerMove(from, to, promotion){
   var betterDesc = (loss>35 && bestVerbose && bestVerbose.san!==result.san) ? plainMove(bestVerbose) : null;
 
   lastMoveSquares = [from, to];
+  hideSuggestion();
   logMove(desc, result.san, 'you', quality.label);
   renderFeedback(quality, desc, context, betterDesc);
   requestMoveCommentary(quality.label, desc, context, betterDesc);
@@ -2712,12 +2758,14 @@ function sendCoachQuestion(){
     if(result.ok && result.text){
       msg = result.text.replace(/</g,'&lt;');
     }else if(result.reason==='bad-key'){
-      msg = "That passphrase wasn't accepted, so this device has been locked again. Ask the owner to unlock it with the correct passphrase.";
-      updateOwnerUI();
+      msg = "The server rejected the passphrase (401) — it doesn't match the Worker's OWNER_PASSPHRASE secret. Double-check both for typos or stray spaces.";
     }else if(result.reason==='not-configured'){
-      msg = "The coach backend hasn't been connected yet (COACH_WORKER_URL isn't set).";
+      msg = "The coach backend hasn't been connected yet (COACH_WORKER_URL isn't set in the HTML).";
     }else{
-      msg = "Sorry, I couldn't reach the coach just now — please try again in a moment.";
+      msg = "Sorry, I couldn't reach the coach just now.";
+    }
+    if(!result.ok && result.detail){
+      msg += ' <span style="opacity:.65;font-size:11.5px;">[' + String(result.detail).replace(/</g,'&lt;') + ']</span>';
     }
     aiBubble.innerHTML = '<span class="who-label">Coach</span>' + msg;
     thread.scrollTop = thread.scrollHeight;
